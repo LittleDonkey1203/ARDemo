@@ -5,13 +5,13 @@
         "name": "default",
         "type": "HarmonyOS",
         "material": {
-          "certpath": "REPLACE_WITH_YOUR_CERT_PATH.cer",
+          "certpath": "C:\\Users\\huawei\\.ohos\\config\\default_ARDemoCode_v2_IDVD30FyXmMJeTEGs-9nqwuysJcth5svAZSYnNDIv_8=.cer",
           "keyAlias": "debugKey",
-          "keyPassword": "REPLACE_WITH_YOUR_KEY_PASSWORD",
-          "profile": "REPLACE_WITH_YOUR_PROFILE_PATH.p7b",
+          "keyPassword": "0000001BFF5AC1FC40A720E2779426C496F7095A3880EF79C9D5902BC29682D3B7068686590EE58226125D",
+          "profile": "C:\\Users\\huawei\\.ohos\\config\\default_ARDemoCode_v2_IDVD30FyXmMJeTEGs-9nqwuysJcth5svAZSYnNDIv_8=.p7b",
           "signAlg": "SHA256withECDSA",
-          "storeFile": "REPLACE_WITH_YOUR_STORE_PATH.p12",
-          "storePassword": "REPLACE_WITH_YOUR_STORE_PASSWORD"
+          "storeFile": "C:\\Users\\huawei\\.ohos\\config\\default_ARDemoCode_v2_IDVD30FyXmMJeTEGs-9nqwuysJcth5svAZSYnNDIv_8=.p12",
+          "storePassword": "0000001B8214C2D752B70B8025C5F4078C7326A9366717D4F20999D66190D40F1123EE5FB2F3F82C5F652C"
         }
       }
     ],

@@ -21,7 +21,9 @@
 #include "graphic/RenderSurface.h"
 #include "wayfinder_renderer.h"
 #include "world/world_background_renderer.h" // reused camera background (NOT modified)
+#include <cstdint>
 #include <glm.hpp>
+#include <vector>
 
 namespace ARObject {
 
@@ -33,6 +35,10 @@ struct RingCameraInfo {
     float pos[3] = {0.0f, 0.0f, 0.0f};
     float viewMat[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     float projMat[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    // Full camera pose (GetDisplayOrientedPose raw[7]): qx,qy,qz,qw, px,py,pz.
+    // Filled every frame; used by OnUpdate to snapshot the camera pose at frame-capture time
+    // so PlaceBeaconInternal can use the same reference frame the cloud saw.
+    float camPoseRaw[7] = {0,0,0,1, 0,0,0};
 };
 
 class RingHuntRenderManager {
@@ -46,10 +52,22 @@ public:
     // Draws background + (if a beacon is placed and its anchor is tracking) the Wayfinder beacon at
     // the anchor: ground ring + pillar core/fog + spinning top + phone icon. color drives the
     // ring/pillar tint (Stage 11A: fixed red), animTime spins the top ring. Fills *outCam.
+    // Da3 capture: if wantCapture && outCaptureRGBA != nullptr, the renderer calls glReadPixels
+    // immediately before SwapBuffers (Y-flipped to image origin = top-left) and fills the buffer
+    // + outW/outH with the current viewport contents (mWidth x mHeight from the app). Returns
+    // true on the success path only; the early-return "not tracking" path skips capture.
     bool OnDrawFrame(AREngine_ARSession *arSession, AREngine_ARFrame *arFrame, bool hasRing,
                      AREngine_ARAnchor *ringAnchor, float animTime, const glm::vec3 &color, float distance,
                      int huntPhase, const glm::quat &frameOrientation, float frameHueTime, bool isAligned,
-                     float deltaTime, float ringHeight, RingCameraInfo *outCam);
+                     float deltaTime, float ringHeight, float badgeFadeProgress, float animAge,
+                     // Phase 2 — clipShiftY 透传到 wayfinder.Render(只对框 + 箭头 MVP 加 clip-space y 偏移)。
+                     float clipShiftY,
+                     RingCameraInfo *outCam,
+                     bool wantCapture, int captureW, int captureH,
+                     std::vector<uint8_t> *outCaptureRGBA, int *outCapW, int *outCapH,
+                     // 拍照纯净帧:在 wayfinder.Render 之前 glReadPixels。同 captureW/H。
+                     bool wantCleanCapture,
+                     std::vector<uint8_t> *outCleanRGBA, int *outCleanW, int *outCleanH);
     void DrawBlack();
 
     GLuint GetPreviewTextureId() { return mBackgroundRenderer.GetTextureId(); }
@@ -61,6 +79,8 @@ private:
     RenderContext mRenderContext;
     RenderSurface mRenderSurface;
     bool isInited = false;
+    // 预分配的 glReadPixels 中转 buffer,避免每帧 vector::resize 堆分配
+    std::vector<uint8_t> capBuf_;
 };
 
 } // namespace ARObject

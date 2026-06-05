@@ -25,9 +25,11 @@
 #include "world/world_ar_application.h"
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <iomanip>
 #include <sstream>
 #include <string>
+#include <vector>
 
 enum class ContextType {
     APP_LIFECYCLE = 0,
@@ -763,6 +765,274 @@ napi_value NapiManager::NapiPlaceRingAt(napi_env env, napi_callback_info info)
     return result;
 }
 
+// v13: setZoom(id, level). level is a number in [1.0, 5.0]; non-number → silent no-op (matches
+// the placeRing* family's silent-failure NAPI style). Returns undefined.
+napi_value NapiManager::NapiSetZoom(napi_env env, napi_callback_info info)
+{
+    LOGD("NapiManager::NapiSetZoom");
+    size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string id = ReadIdArg(env, args[0]);
+    AppNapi *app = NapiManager::GetInstance()->GetApp(id);
+    napi_valuetype t1 = napi_undefined;
+    if (argc >= 2) {
+        napi_typeof(env, args[1], &t1);
+    }
+    if (app == nullptr || argc < 2 || t1 != napi_number) {
+        return nullptr;
+    }
+    double level = 1.0;
+    napi_get_value_double(env, args[1], &level);
+    app->SetZoom(static_cast<float>(level));
+    return nullptr;
+}
+
+// Phase 2 — ArkTS push 可见区 NDC y 边界(跨机型)。args: (id, centerY, halfExtent)。Renderer 用
+// centerY 做 clip-space 框居中,fillRatio 判据用 halfExtent 做纵向归一。
+napi_value NapiManager::NapiSetVisibleNdcY(napi_env env, napi_callback_info info)
+{
+    LOGD("NapiManager::NapiSetVisibleNdcY");
+    size_t argc = 3;
+    napi_value args[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string id = ReadIdArg(env, args[0]);
+    AppNapi *app = NapiManager::GetInstance()->GetApp(id);
+    napi_valuetype t1 = napi_undefined;
+    napi_valuetype t2 = napi_undefined;
+    if (argc >= 3) {
+        napi_typeof(env, args[1], &t1);
+        napi_typeof(env, args[2], &t2);
+    }
+    if (app == nullptr || argc < 3 || t1 != napi_number || t2 != napi_number) {
+        return nullptr;
+    }
+    double centerY = 0.0;
+    double halfExtent = 1.0;
+    napi_get_value_double(env, args[1], &centerY);
+    napi_get_value_double(env, args[2], &halfExtent);
+    app->SetVisibleNdcY(static_cast<float>(centerY), static_cast<float>(halfExtent));
+    return nullptr;
+}
+
+// setDisplayRotation(id, rotation): ArkTS 监听 display.on('change') 后回喂当前的 rotation 值
+// (display.getDefaultDisplaySync().rotation: 0/1/2/3)。非 number → silent no-op。
+napi_value NapiManager::NapiSetDisplayRotation(napi_env env, napi_callback_info info)
+{
+    LOGD("NapiManager::NapiSetDisplayRotation");
+    size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string id = ReadIdArg(env, args[0]);
+    AppNapi *app = NapiManager::GetInstance()->GetApp(id);
+    napi_valuetype t1 = napi_undefined;
+    if (argc >= 2) {
+        napi_typeof(env, args[1], &t1);
+    }
+    if (app == nullptr || argc < 2 || t1 != napi_number) {
+        return nullptr;
+    }
+    double r = 0.0;
+    napi_get_value_double(env, args[1], &r);
+    app->SetDisplayRotation(static_cast<int32_t>(r));
+    return nullptr;
+}
+
+// getOrientation(id) → number(0=PORTRAIT, 1=LANDSCAPE_CW, 2=LANDSCAPE_CCW)。
+// 用于 ArkTS 在抓帧后按物理朝向旋转 JPEG,让 da3 收到与用户构图一致的图。
+napi_value NapiManager::NapiGetOrientation(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string id = ReadIdArg(env, args[0]);
+    AppNapi *app = NapiManager::GetInstance()->GetApp(id);
+    int32_t ori = (app == nullptr) ? 0 : app->GetOrientation();
+    napi_value out = nullptr;
+    napi_create_int32(env, ori, &out);
+    return out;
+}
+
+// 标定工具:同步读取最近一帧的相机姿态。返回 Object {qx,qy,qz,qw,px,py,pz} 或 null。
+static napi_value MakePoseObject(napi_env env, const float p[7])
+{
+    napi_value obj = nullptr;
+    napi_create_object(env, &obj);
+    const char *names[7] = {"qx", "qy", "qz", "qw", "px", "py", "pz"};
+    for (int i = 0; i < 7; ++i) {
+        napi_value v = nullptr;
+        napi_create_double(env, static_cast<double>(p[i]), &v);
+        napi_set_named_property(env, obj, names[i], v);
+    }
+    return obj;
+}
+
+napi_value NapiManager::NapiGetLatestCamRawPose(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string id = ReadIdArg(env, args[0]);
+    AppNapi *app = NapiManager::GetInstance()->GetApp(id);
+    if (app == nullptr) {
+        return nullptr;
+    }
+    float p[7] = {0, 0, 0, 1, 0, 0, 0};
+    if (!app->GetLatestCamRawPose(p)) {
+        return nullptr;
+    }
+    return MakePoseObject(env, p);
+}
+
+napi_value NapiManager::NapiGetLatestCamDispPose(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string id = ReadIdArg(env, args[0]);
+    AppNapi *app = NapiManager::GetInstance()->GetApp(id);
+    if (app == nullptr) {
+        return nullptr;
+    }
+    float p[7] = {0, 0, 0, 1, 0, 0, 0};
+    if (!app->GetLatestCamDispPose(p)) {
+        return nullptr;
+    }
+    return MakePoseObject(env, p);
+}
+
+// Da3 capture: captureFrame(id) — set the request flag; the next render fills the buffer.
+napi_value NapiManager::NapiCaptureFrame(napi_env env, napi_callback_info info)
+{
+    LOGD("NapiManager::NapiCaptureFrame");
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string id = ReadIdArg(env, args[0]);
+    AppNapi *app = NapiManager::GetInstance()->GetApp(id);
+    if (app != nullptr) {
+        app->RequestCapture();
+    }
+    return nullptr;
+}
+
+// Da3 capture: isFrameReady(id) -> boolean.
+napi_value NapiManager::NapiIsFrameReady(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string id = ReadIdArg(env, args[0]);
+    AppNapi *app = NapiManager::GetInstance()->GetApp(id);
+    napi_value result = nullptr;
+    bool ready = (app != nullptr) && app->IsFrameReady();
+    napi_get_boolean(env, ready, &result);
+    return result;
+}
+
+// Da3 capture: takeFrameRGBA(id) -> {buffer:ArrayBuffer, width:number, height:number} | null.
+// Moves the cached RGBA bytes out (clearing readiness) and returns them to ArkTS.
+napi_value NapiManager::NapiTakeFrameRGBA(napi_env env, napi_callback_info info)
+{
+    LOGD("NapiManager::NapiTakeFrameRGBA");
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string id = ReadIdArg(env, args[0]);
+    AppNapi *app = NapiManager::GetInstance()->GetApp(id);
+    if (app == nullptr) {
+        return nullptr;
+    }
+    std::vector<uint8_t> rgba;
+    int w = 0;
+    int h = 0;
+    if (!app->TakeFrameRGBA(rgba, w, h) || rgba.empty() || w <= 0 || h <= 0) {
+        return nullptr;
+    }
+    void *bufData = nullptr;
+    napi_value arrayBuffer = nullptr;
+    if (napi_create_arraybuffer(env, rgba.size(), &bufData, &arrayBuffer) != napi_ok || bufData == nullptr) {
+        LOGE("ARDA3-CAP napi_create_arraybuffer failed bytes=%{public}zu", rgba.size());
+        return nullptr;
+    }
+    std::memcpy(bufData, rgba.data(), rgba.size());
+    napi_value obj = nullptr;
+    napi_create_object(env, &obj);
+    napi_value wv = nullptr;
+    napi_value hv = nullptr;
+    napi_create_int32(env, w, &wv);
+    napi_create_int32(env, h, &hv);
+    napi_set_named_property(env, obj, "buffer", arrayBuffer);
+    napi_set_named_property(env, obj, "width", wv);
+    napi_set_named_property(env, obj, "height", hv);
+    return obj;
+}
+
+// 拍照纯净帧 NAPI 三件套(对应功能 6):captureCleanFrame 触发,isCleanFrameReady 轮询,
+// takeCleanFrameRGBA 取出 RGBA buffer。返回的纯净帧不含信标/炫彩圈/对齐框等 AR 物体。
+napi_value NapiManager::NapiCaptureCleanFrame(napi_env env, napi_callback_info info)
+{
+    LOGD("NapiManager::NapiCaptureCleanFrame");
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string id = ReadIdArg(env, args[0]);
+    AppNapi *app = NapiManager::GetInstance()->GetApp(id);
+    if (app != nullptr) {
+        app->RequestCleanCapture();
+    }
+    return nullptr;
+}
+
+napi_value NapiManager::NapiIsCleanFrameReady(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string id = ReadIdArg(env, args[0]);
+    AppNapi *app = NapiManager::GetInstance()->GetApp(id);
+    napi_value result = nullptr;
+    bool ready = (app != nullptr) && app->IsCleanFrameReady();
+    napi_get_boolean(env, ready, &result);
+    return result;
+}
+
+napi_value NapiManager::NapiTakeCleanFrameRGBA(napi_env env, napi_callback_info info)
+{
+    LOGD("NapiManager::NapiTakeCleanFrameRGBA");
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    std::string id = ReadIdArg(env, args[0]);
+    AppNapi *app = NapiManager::GetInstance()->GetApp(id);
+    if (app == nullptr) {
+        return nullptr;
+    }
+    std::vector<uint8_t> rgba;
+    int w = 0;
+    int h = 0;
+    if (!app->TakeCleanFrameRGBA(rgba, w, h) || rgba.empty() || w <= 0 || h <= 0) {
+        return nullptr;
+    }
+    void *bufData = nullptr;
+    napi_value arrayBuffer = nullptr;
+    if (napi_create_arraybuffer(env, rgba.size(), &bufData, &arrayBuffer) != napi_ok || bufData == nullptr) {
+        LOGE("ARDA3-CAPTURE napi_create_arraybuffer failed bytes=%{public}zu", rgba.size());
+        return nullptr;
+    }
+    std::memcpy(bufData, rgba.data(), rgba.size());
+    napi_value obj = nullptr;
+    napi_create_object(env, &obj);
+    napi_value wv = nullptr;
+    napi_value hv = nullptr;
+    napi_create_int32(env, w, &wv);
+    napi_create_int32(env, h, &hv);
+    napi_set_named_property(env, obj, "buffer", arrayBuffer);
+    napi_set_named_property(env, obj, "width", wv);
+    napi_set_named_property(env, obj, "height", hv);
+    return obj;
+}
+
 napi_value NapiManager::NapiResetRing(napi_env env, napi_callback_info info)
 {
     LOGD("NapiManager::NapiResetRing");
@@ -802,9 +1072,19 @@ napi_value NapiManager::NapiGetRingState(napi_env env, napi_callback_info info)
     float targetYawDeg = 0.0f;
     float targetPitchDeg = 0.0f;
     float targetRollDeg = 0.0f;
+    // 重构(2026-06-03)— 新增字段:
+    //   isAngleAligned + fillRatio(Phase 2)
+    //   snapReady + snapHoldSec(1.5s 持续门 — 调试浮层显示倒计时,UI 不依赖)
+    bool isAngleAligned = false;
+    float fillRatio = 0.0f;
+    bool snapReady = false;
+    float snapHoldSec = 0.0f;
+    float cGraceSec = 0.0f;
+    float fillRatioRaw = 0.0f;
     app->GetRingState(distance, ringPlaced, finishState, isTargetInView, screenEdgeX, screenEdgeY, isBehind,
                       indicatorAngleDeg, ndcX, ndcY, huntPhase, yawDiffRad, pitchDiffRad, rollDiffRad, isAligned,
-                      isLocked, targetYawDeg, targetPitchDeg, targetRollDeg);
+                      isLocked, targetYawDeg, targetPitchDeg, targetRollDeg, isAngleAligned, fillRatio,
+                      snapReady, snapHoldSec, cGraceSec, fillRatioRaw);
 
     napi_value result = nullptr;
     napi_create_object(env, &result);
@@ -865,6 +1145,25 @@ napi_value NapiManager::NapiGetRingState(napi_env env, napi_callback_info info)
     napi_set_named_property(env, result, "targetYawDeg", vTYaw);
     napi_set_named_property(env, result, "targetPitchDeg", vTPitch);
     napi_set_named_property(env, result, "targetRollDeg", vTRoll);
+    // 重构 — 新字段。
+    napi_value vAngleAligned = nullptr;
+    napi_value vFill = nullptr;
+    napi_value vSnapReady = nullptr;
+    napi_value vSnapHoldSec = nullptr;
+    napi_value vCGraceSec = nullptr;
+    napi_value vFillRaw = nullptr;
+    napi_get_boolean(env, isAngleAligned, &vAngleAligned);
+    napi_create_double(env, static_cast<double>(fillRatio), &vFill);
+    napi_get_boolean(env, snapReady, &vSnapReady);
+    napi_create_double(env, static_cast<double>(snapHoldSec), &vSnapHoldSec);
+    napi_create_double(env, static_cast<double>(cGraceSec), &vCGraceSec);
+    napi_create_double(env, static_cast<double>(fillRatioRaw), &vFillRaw);
+    napi_set_named_property(env, result, "isAngleAligned", vAngleAligned);
+    napi_set_named_property(env, result, "fillRatio", vFill);
+    napi_set_named_property(env, result, "snapReady", vSnapReady);
+    napi_set_named_property(env, result, "snapHoldSec", vSnapHoldSec);
+    napi_set_named_property(env, result, "cGraceSec", vCGraceSec);
+    napi_set_named_property(env, result, "fillRatioRaw", vFillRaw);
     return result;
 }
 

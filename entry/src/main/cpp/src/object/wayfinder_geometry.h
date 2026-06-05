@@ -45,11 +45,6 @@ public:
     // Ground ring: flat annulus in the XZ plane at y=0, normal +Y. 30cm outer dia / 24cm inner.
     static WayfinderMesh CreateGroundRing(float outerRadius = 0.15f, float innerRadius = 0.12f, int segments = 64);
 
-    // Ripple ring: a thin flat annulus in the XZ plane at y=0, normal +Y, used for the expanding
-    // ground "water ripple". uv.y = 0 on the inner edge, 1 on the outer edge, so the solid shader's
-    // alphaBase/alphaTop fade the wave radially (strong inner -> faint outer). Radii animate per frame.
-    static WayfinderMesh CreateRippleRing(float innerRadius, float outerRadius, int segments = 64);
-
     // Main beam: thin "laser line" cylinder side, y in [0, height], 4mm dia. uv.y = y/height.
     static WayfinderMesh CreatePillarCore(float radius = 0.002f, float height = kWayfinderTopHeight, int segments = 24);
 
@@ -84,11 +79,11 @@ public:
     // Alignment frame (Stage 11D, Stage 12C-shrunk): a rounded-rectangle BORDER (a filled band of
     // `thickness`) in the XY plane (z=0), normal +Z, centered at the origin. Rendered as a triangle
     // list. uv.x runs 0..1 around the perimeter (drives the hue gradient); uv.y = 0 inner edge / 1
-    // outer edge. 7.5x15cm outer, 0.5cm band, 0.5cm outer corner radius — halved from the original
-    // 15x30 so the frame fits inside the camera-style viewport. (A further-shrunk 5x10cm variant
-    // was tried but felt too small at the 30cm ALIGNING distance — reverted to this size.)
-    // Oriented in 6DoF by the renderer.
-    static WayfinderMesh CreateAlignmentFrame(float width = 0.075f, float height = 0.15f, float thickness = 0.005f,
+    // outer edge.
+    // Phase 1.5(2026-06-02):aspect 1:2(0.075×0.15)→ 3:4(0.075×0.10),匹配用户实际看到的可见区
+    //   (XComponent 顶 + 底黑条遮罩后剩下中间 1256×1680 strip,aspect 0.748 ≈ 3:4),配合 renderer
+    //   scale 2.47 实现 30cm 处 88% 填满可见区。Oriented in 6DoF by the renderer.
+    static WayfinderMesh CreateAlignmentFrame(float width = 0.075f, float height = 0.10f, float thickness = 0.005f,
                                               float cornerRadius = 0.005f, int segPerCorner = 8);
 
     // 3D arrow (Stage 11D, Stage 12C-shrunk to ~40%): a thin cylinder shaft + a single flat
@@ -98,6 +93,29 @@ public:
     static WayfinderMesh CreateArrow3D(float shaftRadius = 0.0006f, float shaftLength = 0.016f,
                                        float wingSpan = 0.0048f, float wingThickness = 0.0008f,
                                        float headLength = 0.008f, int shaftSegments = 16);
+
+    // Water drop: low-poly UV sphere centered at the origin, ~2.5cm radius (5cm diameter). uv.x =
+    // longitude (0..1), uv.y = 0 bottom (south pole) → 1 top (north pole) so the iridescent FLOW
+    // shader (axis=1) sweeps pearl colors vertically while the drop falls. Used by the placement
+    // sequence animation (stage 2: drop falls from badge to ground).
+    static WayfinderMesh CreateWaterDrop(float radius = 0.025f, int segments = 20, int stacks = 12);
+
+    // Snap celebration FX(2026-06-03)— 炫彩薄膜:对齐框内部的填充矩形(2 三角形),与框几何同尺寸
+    // (default 0.075×0.10,3:4)。uv (0..1, 0..1),供 MEMBRANE shader 沿 uv 流 pearl + flash + 转青绿。
+    // 在框中央 z=0 平面,法线 +Z(同框)。aligned 0→1 边缘触发庆祝特效时显示。
+    static WayfinderMesh CreateAlignmentMembrane(float width = 0.075f, float height = 0.10f);
+
+    // Debug axes: 3 line segments from (0,0,0) along +X (red), +Y (green), +Z (blue), each `length`
+    // metres long. Indices form 3 disjoint GL_LINES pairs so the caller can draw all 3 axes with a
+    // single DrawElements call (same mvp, different colors per axis → 3 draw calls).
+    static WayfinderMesh CreateAxesLines(float length = 1.0f);
+
+    // Dashed-axis variant: each axis is split into short segments (dashLen on, gapLen off) so the
+    // caller can draw dashed lines without glLineStipple (unavailable in OpenGL ES).
+    static WayfinderMesh CreateAxesLinesDashed(float length = 1.0f, float dashLen = 0.04f, float gapLen = 0.03f);
+
+    // Debug sphere: low-poly UV sphere at origin, used to mark the cloud target position.
+    static WayfinderMesh CreateDebugSphere(float radius = 0.05f, int segments = 16, int stacks = 10);
 };
 
 } // namespace ARObject

@@ -61,7 +61,12 @@ bool RingHuntRenderManager::OnDrawFrame(AREngine_ARSession *arSession, AREngine_
                                         AREngine_ARAnchor *ringAnchor, float animTime, const glm::vec3 &color,
                                         float distance, int huntPhase, const glm::quat &frameOrientation,
                                         float frameHueTime, bool isAligned, float deltaTime, float ringHeight,
-                                        RingCameraInfo *outCam)
+                                        float badgeFadeProgress, float animAge, float clipShiftY,
+                                        RingCameraInfo *outCam,
+                                        bool wantCapture, int captureW, int captureH,
+                                        std::vector<uint8_t> *outCaptureRGBA, int *outCapW, int *outCapH,
+                                        bool wantCleanCapture,
+                                        std::vector<uint8_t> *outCleanRGBA, int *outCleanW, int *outCleanH)
 {
     if (!isInited) {
         LOGE("RingHuntRenderManager not ready!");
@@ -90,6 +95,10 @@ bool RingHuntRenderManager::OnDrawFrame(AREngine_ARSession *arSession, AREngine_
                 float raw[7] = {0.0f};
                 HMS_AREngine_ARPose_GetPoseRaw(arSession, camPose, raw, 7);
                 cameraPos = glm::vec3(raw[4], raw[5], raw[6]);
+                // Hand the full camera pose to OnUpdate so it can snapshot at capture time
+                if (outCam != nullptr) {
+                    std::memcpy(outCam->camPoseRaw, raw, sizeof(float) * 7);
+                }
             }
             HMS_AREngine_ARPose_Destroy(camPose);
         }
@@ -108,6 +117,60 @@ bool RingHuntRenderManager::OnDrawFrame(AREngine_ARSession *arSession, AREngine_
 
     mBackgroundRenderer.Draw(arSession, arFrame);
 
+    // ── Frame captures: do these BEFORE the tracking check so DA3 / photo captures succeed
+    //     even when AR tracking is temporarily lost. Cloud-side VGGT inference does its own
+    //     pose estimation from images and does not depend on AR Engine tracking state.
+    //     Captured frames are camera-only (no AR overlay drawn yet). ──────────────────────
+    //
+    // 性能优化:glReadPixels 是同步阻塞调用,会强制 GPU 管线排空再回读像素。
+    //   1) 用缩放后的尺寸(capScale=0.5)读,6MB→1.5MB,大幅减少 GPU→CPU 拷贝量
+    //   2) Y-flip 改为逐行写入目标 buffer,省掉临时 buffer + 二次拷贝
+    //   3) 预分配 target buffer(capBuf_),避免每帧 vector::resize 堆分配
+    //   4) clean 和 da3 不会同时触发(互斥),不会双倍阻塞
+
+    constexpr float kCapScale = 1.0f;  // 全分辨率读取(ArkTS 侧 resize 到 512,这里保证 viewport 对齐)
+    const int capReadW = std::max(1, static_cast<int>(captureW * kCapScale));
+    const int capReadH = std::max(1, static_cast<int>(captureH * kCapScale));
+
+    // 拍照纯净帧
+    if (wantCleanCapture && outCleanRGBA != nullptr && captureW > 0 && captureH > 0) {
+        size_t bytes = static_cast<size_t>(capReadW) * static_cast<size_t>(capReadH) * 4u;
+        if (capBuf_.size() < bytes) { capBuf_.resize(bytes); }
+        glReadPixels(0, 0, capReadW, capReadH, GL_RGBA, GL_UNSIGNED_BYTE, capBuf_.data());
+        // Y-flip:直接倒序写入输出 buffer,省掉临时 buffer
+        outCleanRGBA->resize(bytes);
+        const size_t rowStride = static_cast<size_t>(capReadW) * 4u;
+        for (int y = 0; y < capReadH; ++y) {
+            uint8_t *dst = outCleanRGBA->data() + y * rowStride;
+            const uint8_t *src = capBuf_.data() + (capReadH - 1 - y) * rowStride;
+            std::memcpy(dst, src, rowStride);
+        }
+        if (outCleanW != nullptr) { *outCleanW = capReadW; }
+        if (outCleanH != nullptr) { *outCleanH = capReadH; }
+        LOGI("ARDA3-CAPTURE clean glReadPixels done %{public}dx%{public}d (scaled from %{public}dx%{public}d)",
+             capReadW, capReadH, captureW, captureH);
+    }
+
+    // Da3 capture
+    if (wantCapture && outCaptureRGBA != nullptr && captureW > 0 && captureH > 0) {
+        size_t bytes = static_cast<size_t>(capReadW) * static_cast<size_t>(capReadH) * 4u;
+        if (capBuf_.size() < bytes) { capBuf_.resize(bytes); }
+        glReadPixels(0, 0, capReadW, capReadH, GL_RGBA, GL_UNSIGNED_BYTE, capBuf_.data());
+        outCaptureRGBA->resize(bytes);
+        const size_t rowStride = static_cast<size_t>(capReadW) * 4u;
+        for (int y = 0; y < capReadH; ++y) {
+            uint8_t *dst = outCaptureRGBA->data() + y * rowStride;
+            const uint8_t *src = capBuf_.data() + (capReadH - 1 - y) * rowStride;
+            std::memcpy(dst, src, rowStride);
+        }
+        if (outCapW != nullptr) { *outCapW = capReadW; }
+        if (outCapH != nullptr) { *outCapH = capReadH; }
+        LOGI("ARDA3-CAP glReadPixels done %{public}dx%{public}d (scaled from %{public}dx%{public}d)",
+             capReadW, capReadH, captureW, captureH);
+    }
+
+    // AR overlays (axes, wayfinder) require tracking. If lost, swap and bail — but captures
+    // above already succeeded so cloud inference keeps running.
     if (camTracking != ARENGINE_TRACKING_STATE_TRACKING) {
         mRenderContext.SwapBuffers(&mRenderSurface);
         return false;
@@ -129,7 +192,8 @@ bool RingHuntRenderManager::OnDrawFrame(AREngine_ARSession *arSession, AREngine_
             // rotation), so the ground ring lies flat on the floor and the pillar rises straight up.
             glm::mat4 wayfinderToWorld = glm::translate(glm::mat4(1.0f), ringPos);
             mWayfinderRenderer.Render(viewMat, projectionMat, wayfinderToWorld, cameraPos, color, animTime, distance,
-                                      huntPhase, frameOrientation, frameHueTime, isAligned, deltaTime, ringHeight);
+                                      huntPhase, frameOrientation, frameHueTime, isAligned, deltaTime, ringHeight,
+                                      badgeFadeProgress, animAge, clipShiftY);
         }
     }
 
