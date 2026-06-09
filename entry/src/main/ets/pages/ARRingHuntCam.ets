@@ -26,9 +26,9 @@ import { Palette, FontSize, Spacing, Radius } from '../styles/Theme';
 import { CameraChrome } from '../components/CameraChrome';
 import { ReferencePanel, RefImageHolder } from '../components/ReferencePanel';
 import { generate as da3Generate, getGuide as da3GetGuide, packPixelMapToJpeg, parseGuideString, GuideData as Da3GuideData } from '../services/Da3Service';
-import { WsGuideClient, WsPoseResult, extractGuideField } from '../services/Da3WsService';
+import { WsGuideClient, WsPoseResult, BeaconWorld, extractGuideField } from '../services/Da3WsService';
 import { getCloudConfig } from '../config/CloudConfig';
-import { getBackendType, setBackendType, getBackendLabel, allBackendTypes, initBackendType, BackendType } from '../config/CloudConfig';
+import { getBackendType, setBackendType, getBackendLabel, allBackendTypes, initBackendType, BackendType, getUseBeaconWorld } from '../config/CloudConfig';
 
 // v13 (c): da3 机位服务返回的 guideData — 全 string,由 applyGuide 转 number 并喂给
 // placeRingAt + applyZoom。语义跟 placeRingAt 一致:x=右(米)/ y=圆环离地高度(米)/ z=前(米),
@@ -69,6 +69,7 @@ struct ARRingHuntCam {
 
   @State distance: number = 99;
   @State ringPlaced: boolean = false;
+  @State guideUpdateCount: number = 0;
 
   // 6DoF alignment.
   @State huntPhase: number = 0; // 0=APPROACHING 1=ALIGNING 2=LOCKED
@@ -82,6 +83,7 @@ struct ARRingHuntCam {
   @State isAngleAligned: boolean = false;
   @State fillRatio: number = 0;     // EMA 平滑后,过头提示 (>1.0) 用
   @State isLocked: boolean = false;
+  @State inDeadzone: boolean = false;
   private prevLocked: boolean = false;
   // 进 30cm 边缘检测:huntPhase 上一帧值。0→1 切换时触发一次短震(第一阶段完成,进对齐阶段)。
   private prevHuntPhase: number = 0;
@@ -528,6 +530,12 @@ struct ARRingHuntCam {
       Logger.warn(`[applyGuide] NaN in pose fields, skip: x=${g.x} y=${g.y} z=${g.z} yaw=${g.yaw} pitch=${g.pitch} roll=${g.roll}`);
       return;
     }
+    const posDist: number = Math.sqrt(x * x + y * y + z * z);
+    const angDist: number = Math.abs(yaw) + Math.abs(pitch) + Math.abs(roll);
+    if (posDist < 0.001 && angDist < 0.01) {
+      Logger.warn(`[applyGuide] zero guide (pos=${posDist} ang=${angDist}), skip`);
+      return;
+    }
     // 清场景(含 native 锚点 detach+release)+ 流程状态。da3 会话/参考图不动 —— applyGuide
     // 是同一会话内的 step2,sessionTaskId 和 targetJpeg 后续可能还要用。
     this.resetSceneOnly();
@@ -547,6 +555,7 @@ struct ARRingHuntCam {
       return;
     }
     this.ringPlaced = true;
+    this.guideUpdateCount++;
     // 注意:不调 enterAiModeAndOpenCard()。applyGuide 是 step2(点参考图)的产物,onTargetTap
     // 已主动收起卡片栏让出取景空间;此处再展开会和功能②冲突。panelExpanded(AI 模式)在
     // onBeaconTap 时已设好,这里无需重设。卡片保持 onTargetTap 收起的状态,用户点 chevron 可
@@ -555,6 +564,26 @@ struct ARRingHuntCam {
     // if (!Number.isNaN(zoom) && zoom > 0) {
     //   this.applyZoom(Math.min(5.0, Math.max(1.0, zoom)));
     // }
+  }
+
+  private applyGuideFromGuideString(pose: WsPoseResult): void {
+    const gs: Record<string, ESObject> | undefined = pose.guide_string;
+    if (gs === undefined) {
+      Logger.warn('ARDA3-WS loop: pose without guide_string');
+      return;
+    }
+    const rawGs: Da3GuideData = {
+      x:     extractGuideField(gs, 'x', '0'),
+      y:     extractGuideField(gs, 'y', '0'),
+      z:     extractGuideField(gs, 'z', '0'),
+      pitch: extractGuideField(gs, 'pitch', '0'),
+      yaw:   extractGuideField(gs, 'yaw', '0'),
+      roll:  extractGuideField(gs, 'roll', '0'),
+      zoom:  extractGuideField(gs, 'zoom', '1'),
+    };
+    const parsed: Da3GuideData = parseGuideString(rawGs);
+    Logger.info(`ARDA3-WS loop frame ${this.guideLoopFrameCount}: raw=${JSON.stringify(rawGs)} parsed=${JSON.stringify(parsed)}`);
+    this.applyGuide(parsed as GuideData);
   }
 
   // AI 机位 action: place a wayfinder beacon (random 6DoF target). Repeated taps cause native to
@@ -727,6 +756,7 @@ struct ARRingHuntCam {
       this.targetJpeg = undefined;
       this.sessionTaskId = util.generateRandomUUID();
       Logger.info(`ARDA3-WS new session: ${this.sessionTaskId}`);
+      this.guideUpdateCount = 0;
       this.enterAiModeAndOpenCard();
       this.refLoading = true;
       if (this.zoom !== 1.0) {
@@ -935,40 +965,55 @@ struct ARRingHuntCam {
             }
 
             Logger.info(`ARDA3-WS loop frame ${this.guideLoopFrameCount}/${maxFrames}: sending (${current.byteLength}B)`);
-            client.sendFrame(current);
+            // 优先发 0x04（带 DisplayOriented pose）；tracking 未就绪时降级发 0x01（云侧 scale=1.0）。
+            // 必须用 DispPose（GetDisplayOrientedPose）而非 RawPose（GetPose），因为 JPEG 是显示方向的，
+            // 云侧 VGGT 相机坐标系与显示方向对齐，用 RawPose 会导致 beacon 偏移旋转~90°。
+            const camPose: CamPose | null = arEngineDemo.getLatestCamDispPose(this.idStr);
+            if (camPose !== null) {
+              client.sendFrameWithPose(current,
+                camPose.px, camPose.py, camPose.pz,
+                camPose.qx, camPose.qy, camPose.qz, camPose.qw);
+            } else {
+              client.sendFrame(current);
+            }
           }, intervalMs);
         }
       },
-      // onPose — 云侧推理完成，带回 guide_string
+      // onPose — 云侧推理完成，带回 guide_string（可选 beacon_world）
       (pose: WsPoseResult): void => {
         if (stopped) {
           return;
         }
-        // 首帧推理完成 → 云侧已就绪，关掉 spinner
         if (!poseReceived) {
           poseReceived = true;
           this.refLoading = false;
           Logger.info('ARDA3-WS loop: first pose received, server ready');
         }
-        const gs: Record<string, ESObject> | undefined = pose.guide_string;
-        if (gs === undefined) {
-          Logger.warn('ARDA3-WS loop: pose without guide_string');
-          return;
+        this.inDeadzone = pose.in_deadzone === true;
+
+        // ── beacon_world 路径：直接传世界坐标给 C++，不做 world→local→world 往返 ──
+        const bw: BeaconWorld | undefined = pose.beacon_world;
+        if (getUseBeaconWorld() && bw !== undefined &&
+            bw.position.length >= 3 && bw.quaternion.length >= 4) {
+          Logger.info(`ARDA3-WS beacon_world: worldPos=[${bw.position.map((v: number): string => v.toFixed(4)).join(',')}] ` +
+            `quat=[${bw.quaternion.map((v: number): string => v.toFixed(4)).join(',')}]`);
+          this.resetSceneOnly();
+          let id: number = arEngineDemo.placeRingAtWorld(this.idStr,
+            bw.position[0], bw.position[1], bw.position[2],
+            bw.quaternion[0], bw.quaternion[1], bw.quaternion[2], bw.quaternion[3]);
+          Logger.info(`[applyGuide] placeRingAtWorld -> ${id}`);
+          if (id < 0) {
+            this.toast('请稳住手机等待跟踪稳定');
+          } else {
+            this.ringPlaced = true;
+            this.guideUpdateCount++;
+          }
+        } else {
+          // ── guide_string 路径（原有逻辑 / beacon_world 不存在时回退） ──
+          Logger.info(`ARDA3-WS beacon_world skipped: useFlag=${getUseBeaconWorld()} bw=${bw !== undefined} ` +
+            `posLen=${bw !== undefined ? bw.position.length : -1} quatLen=${bw !== undefined ? bw.quaternion.length : -1}`);
+          this.applyGuideFromGuideString(pose);
         }
-        // 从 WS 提取原始 guide_string（中文方向词），解析为裸数字再喂 applyGuide
-        const rawGs: Da3GuideData = {
-          x:     extractGuideField(gs, 'x', '0'),
-          y:     extractGuideField(gs, 'y', '0'),
-          z:     extractGuideField(gs, 'z', '0'),
-          pitch: extractGuideField(gs, 'pitch', '0'),
-          yaw:   extractGuideField(gs, 'yaw', '0'),
-          roll:  extractGuideField(gs, 'roll', '0'),
-          zoom:  extractGuideField(gs, 'zoom', '1'),
-        };
-        // parseGuideString 把 "右 0.15 米" 转为 "0.15"，applyGuide 才能 Number() 成功
-        const parsed: Da3GuideData = parseGuideString(rawGs);
-        Logger.info(`ARDA3-WS loop frame ${this.guideLoopFrameCount}: raw=${JSON.stringify(rawGs)} parsed=${JSON.stringify(parsed)}`);
-        this.applyGuide(parsed as GuideData);
 
         setTimeout((): void => {
           if (this.isLocked) {
@@ -990,6 +1035,18 @@ struct ARRingHuntCam {
         }
         imageReceived = true;
         Logger.info(`ARDA3-WS loop: target image received (${jpegBytes.byteLength}B)`);
+        try {
+          const ts: number = systemDateTime.getTime(false);
+          const path: string = `${this.context.filesDir}/target_${ts}.jpg`;
+          const f: fileIo.File = fileIo.openSync(path,
+            fileIo.OpenMode.CREATE | fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.TRUNC);
+          fileIo.writeSync(f.fd, jpegBytes);
+          fileIo.closeSync(f.fd);
+          Logger.info(`ARDA3-WS loop: target image saved path=${path} bytes=${jpegBytes.byteLength}`);
+        } catch (e) {
+          const err: BusinessError = e as BusinessError;
+          Logger.warn(`ARDA3-WS loop: target image save failed: ${err.message}`);
+        }
         // 解码 JPEG → PixelMap
         try {
           const src: image.ImageSource = image.createImageSource(jpegBytes);
@@ -2054,7 +2111,7 @@ struct ARRingHuntCam {
           if (this.ringPlaced && this.huntPhase !== 2) {
             Row() {
               Column({ space: 2 }) {
-                Text(`距离 ${this.distText()} m`)
+                Text(`距离 ${this.distText()} m  #${this.guideUpdateCount}${this.inDeadzone ? '  ◉位置锁定' : ''}`)
                   .fontSize(FontSize.hud)
                   .fontColor(Palette.white)
                 Text(`偏航 ${this.formatDiff(this.yawDiffRad)}  俯仰 ${this.formatDiff(this.pitchDiffRad)}  翻滚 ${this.formatDiff(this.rollDiffRad)}`)

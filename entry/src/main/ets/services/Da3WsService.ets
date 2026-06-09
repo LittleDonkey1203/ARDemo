@@ -14,7 +14,7 @@
 //
 // 云 → 端（文本 JSON）：
 //   {"type":"status","status":"ready"}
-//   {"type":"pose","frame_seq":N,...,"guide_string":{...}}
+//   {"type":"pose","frame_seq":N,...,"guide_string":{...},"beacon_world":{"position":[x,y,z],"quaternion":[x,y,z,w]}}
 //   {"type":"error","code":"...","detail":"..."}
 
 import webSocket from '@ohos.net.webSocket';
@@ -28,12 +28,19 @@ const TAG = 'ARDA3-WS';
 // ── 常量（协议层） ────────────────────────────────────────────
 const MSG_FRAME: number = 0x01;
 const MSG_CONTROL: number = 0x02;
+const MSG_FRAME_WITH_POSE: number = 0x04;
 const CTRL_RESET: number = 0x01;
-const HEADER_SIZE: number = 9; // 1 type + 4 seq + 4 timestamp_ms
+const HEADER_SIZE: number = 9;      // 1 type + 4 seq + 4 timestamp_ms
+const POSE_HEADER_SIZE: number = 37; // 9 + 7×float32 (tx,ty,tz,qx,qy,qz,qw)
 
 // ── 接收数据类型 ──────────────────────────────────────────────
 
-// 云侧 pose 响应（包含 guide_string）
+// 云侧 pose 响应（包含 guide_string，可选 beacon_world）
+export interface BeaconWorld {
+  position: number[];    // [x, y, z] ARKit 世界坐标
+  quaternion: number[];  // [x, y, z, w] scalar-last
+}
+
 export interface WsPoseResult {
   frame_seq: number;
   timestamp_ms: number;
@@ -43,7 +50,10 @@ export interface WsPoseResult {
   current_quaternion: number[];
   fov: number[];
   guide_string?: Record<string, ESObject>;
+  beacon_world?: BeaconWorld;
   guidance?: string;
+  infer_count?: number;
+  in_deadzone?: boolean;
 }
 
 // guide_string 的实际字段（云侧 JSON 中返回的中文方向串）
@@ -171,6 +181,47 @@ export class WsGuideClient {
     return true;
   }
 
+  // 发送带 ARKit pose 的帧（0x04）：附带 7×float32 world pose（tx,ty,tz,qx,qy,qz,qw）。
+  // 当 AR tracking 可靠时调用；tracking 丢失时改调 sendFrame（降级为 0x01）。
+  sendFrameWithPose(jpegBytes: ArrayBuffer,
+                    tx: number, ty: number, tz: number,
+                    qx: number, qy: number, qz: number, qw: number): boolean {
+    if (!this.ws || !this.connected) {
+      return false;
+    }
+
+    this.seq++;
+    const ts: number = Math.floor(systemDateTime.getTime(false));
+    const totalLen: number = POSE_HEADER_SIZE + jpegBytes.byteLength;
+
+    const packet: ArrayBuffer = new ArrayBuffer(totalLen);
+    const view: DataView = new DataView(packet);
+    view.setUint8(0, MSG_FRAME_WITH_POSE);
+    view.setUint32(1, this.seq, false);
+    view.setUint32(5, ts, false);
+    view.setFloat32(9,  tx, false);
+    view.setFloat32(13, ty, false);
+    view.setFloat32(17, tz, false);
+    view.setFloat32(21, qx, false);
+    view.setFloat32(25, qy, false);
+    view.setFloat32(29, qz, false);
+    view.setFloat32(33, qw, false);
+
+    const pkt8: Uint8Array = new Uint8Array(packet);
+    const jpg8: Uint8Array = new Uint8Array(jpegBytes);
+    pkt8.set(jpg8, POSE_HEADER_SIZE);
+
+    this.ws.send(packet, (err: BusinessError) => {
+      if (err) {
+        Logger.error(`${TAG} send frame+pose ${this.seq} FAIL: ${err.message}`);
+      }
+    });
+
+    Logger.info(`${TAG} sent frame+pose seq=${this.seq} ts=${ts} jpeg=${jpegBytes.byteLength}B ` +
+                `t=[${tx.toFixed(3)},${ty.toFixed(3)},${tz.toFixed(3)}]`);
+    return true;
+  }
+
   // 发送 RESET 控制消息
   sendReset(): void {
     if (!this.ws || !this.connected) {
@@ -245,10 +296,25 @@ export class WsGuideClient {
       } else if (msgType === 'pose') {
         const guide: Record<string, ESObject> | undefined =
           msg['guide_string'] !== undefined ? msg['guide_string'] as Record<string, ESObject> : undefined;
+        const rawBw: ESObject = msg['beacon_world'];
+        let bw: BeaconWorld | undefined = undefined;
+        if (rawBw !== undefined && rawBw !== null) {
+          const bwObj: Record<string, ESObject> = rawBw as Record<string, ESObject>;
+          const pos: ESObject = bwObj['position'];
+          const quat: ESObject = bwObj['quaternion'];
+          if (pos instanceof Array && quat instanceof Array) {
+            bw = { position: pos as number[], quaternion: quat as number[] };
+          }
+        }
+        if (bw !== undefined) {
+          (msg as Record<string, ESObject>)['beacon_world'] = bw as ESObject;
+        }
         if (guide !== undefined) {
-          Logger.info(`${TAG} recv pose frame_seq=${msg['frame_seq']} guide=${JSON.stringify(guide)}`);
+          Logger.info(`${TAG} recv pose frame_seq=${msg['frame_seq']} guide=${JSON.stringify(guide)}` +
+            (bw !== undefined ? ` beacon_world=pos[${bw.position.map((v: number): string => v.toFixed(4)).join(',')}]` : ''));
         } else {
-          Logger.info(`${TAG} recv pose frame_seq=${msg['frame_seq']} (no guide_string)`);
+          Logger.info(`${TAG} recv pose frame_seq=${msg['frame_seq']} (no guide_string)` +
+            (bw !== undefined ? ` beacon_world=pos[${bw.position.map((v: number): string => v.toFixed(4)).join(',')}]` : ''));
         }
         if (this.onPose) {
           this.onPose(msg as Record<string, ESObject> as WsPoseResult);
