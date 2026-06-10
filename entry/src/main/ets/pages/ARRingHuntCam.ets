@@ -163,6 +163,15 @@ struct ARRingHuntCam {
   // 后端切换:da3 / vggt-omega。点一下切下一个。
   @State backendType: BackendType = getBackendType();
 
+  // ===== Scale 校准引导 =====
+  @State private scaleCalStep: number = 0;
+  @State private scaleCalOpacity: number = 0;
+  @State private scaleCalText: string = '';
+  private scaleCalOrigin: CamPose | null = null;
+  private scaleCalTimerMoveId: number = -1;
+  private scaleCalTimerNudgeId: number = -1;
+  private scaleCalCompleteTimerId: number = -1;
+
   // ===== 标定工具状态(完全旁路) =====
   // 标定模式总开关。true 时显示标定 overlay,其它正常 UI 不受影响。
   @State calibMode: boolean = false;
@@ -509,6 +518,7 @@ struct ARRingHuntCam {
     this.hudOpacity = 0;
     this.hideLockedBanner();
     this.resetGuidance();
+    this.stopScaleCalGuidance();
   }
 
   // v13 (c) — guideData → AR end-to-end glue. Parses the 7 string fields, validates, then routes
@@ -645,6 +655,8 @@ struct ARRingHuntCam {
 
   private captureJpeg(): Promise<ArrayBuffer | null> {
     return new Promise<ArrayBuffer | null>((resolve: (v: ArrayBuffer | null) => void) => {
+      // 排空上一次残留的旧帧,保证后续 isFrameReady 轮询等到的是本次 captureFrame 触发的新帧
+      arEngineDemo.takeFrameRGBA(this.idStr);
       arEngineDemo.captureFrame(this.idStr);
       let tries: number = 0;
       let reFired: boolean = false;
@@ -680,6 +692,9 @@ struct ARRingHuntCam {
           editable: true
         };
         image.createPixelMap(cap.buffer, opts).then(async (pm: image.PixelMap) => {
+          // 先裁可见区再扶正(与 captureCleanJpeg / captureJpegForCalib 一致),
+          // 去掉顶+底黑条,让云侧收到的图 = 用户实际看到的画面。
+          await this.cropToVisibleRegion(pm);
           // 按 native 报告的物理朝向把图旋正,让 da3 收到的图和用户视觉构图一致。
           // 0=PORTRAIT(不转), 1=LANDSCAPE_CW(顺时针横拿,把图逆时针 90° → da3 看到横画布), 2=LANDSCAPE_CCW(反向)。
           const ori: number = arEngineDemo.getOrientation(this.idStr);
@@ -705,7 +720,7 @@ struct ARRingHuntCam {
             const sx: number = 512 / imgInfo.size.width;
             const sy: number = 512 / imgInfo.size.height;
             const s: number = Math.min(sx, sy);
-            pm.scale(s, s);
+            await pm.scale(s, s);
             Logger.info(`ARDA3-CAP scaled ${s.toFixed(3)} → ~512px`);
           } catch (e) {
             Logger.warn(`ARDA3-CAP scale failed: ${(e as BusinessError).message}`);
@@ -721,9 +736,13 @@ struct ARRingHuntCam {
               const path: string = `${this.context.filesDir}/cap_${systemDateTime.getTime(false)}.jpg`;
               const f: fileIo.File = fileIo.openSync(path,
                 fileIo.OpenMode.CREATE | fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.TRUNC);
-              fileIo.writeSync(f.fd, jpeg);
-              fileIo.closeSync(f.fd);
-              Logger.info(`ARDA3-CAP jpeg saved path=${path}`);
+              fileIo.write(f.fd, jpeg).then(() => {
+                fileIo.closeSync(f.fd);
+                Logger.info(`ARDA3-CAP jpeg saved path=${path}`);
+              }).catch((e: BusinessError) => {
+                Logger.warn(`ARDA3-CAP save write failed: ${e.message}`);
+                try { fileIo.closeSync(f.fd); } catch (_e) {}
+              });
             } catch (e) {
               const err: BusinessError = e as BusinessError;
               Logger.warn(`ARDA3-CAP save failed code=${err.code} msg=${err.message}`);
@@ -765,6 +784,7 @@ struct ARRingHuntCam {
       }
       Logger.info('ARDA3-WS beacon tap → starting WebSocket guide loop');
       this.toast('连接云侧…');
+      this.startScaleCalGuidance();
       this.runGuideLoop();
     } else {
       // ── da3: HTTP 两段式 ──
@@ -897,6 +917,7 @@ struct ARRingHuntCam {
       client.close();
       this.busyGuide = false;
       this.wsClient = undefined;
+      this.stopScaleCalGuidance();
     };
 
     // ── 连接 ──
@@ -1267,6 +1288,84 @@ struct ARRingHuntCam {
       this.lockedBannerTimer = -1;
     }
     this.lockedBannerOpacity = 0;
+  }
+
+  // ── Scale 校准引导 ──────────────────────────────────────────────
+  private startScaleCalGuidance(): void {
+    this.stopScaleCalGuidance();
+    this.scaleCalOrigin = arEngineDemo.getLatestCamDispPose(this.idStr) ?? null;
+    this.scaleCalStep = 1;
+    this.scaleCalText = '请将手机对准目标';
+    animateTo({ duration: 300, curve: Curve.EaseOut }, () => {
+      this.scaleCalOpacity = 1;
+    });
+    this.scaleCalTimerMoveId = setTimeout(() => {
+      this.scaleCalTimerMoveId = -1;
+      this.advanceScaleCalToMove();
+    }, 700);
+  }
+
+  private advanceScaleCalToMove(): void {
+    if (this.scaleCalStep !== 1) {
+      return;
+    }
+    this.scaleCalStep = 2;
+    this.scaleCalText = '保持对准，慢慢向旁边走一小步';
+    if (this.scaleCalOrigin == null) {
+      this.scaleCalOrigin = arEngineDemo.getLatestCamDispPose(this.idStr) ?? null;
+    }
+    this.scaleCalTimerNudgeId = setTimeout(() => {
+      this.scaleCalTimerNudgeId = -1;
+      this.advanceScaleCalToNudge();
+    }, 5000);
+  }
+
+  private advanceScaleCalToNudge(): void {
+    if (this.scaleCalStep !== 2) {
+      return;
+    }
+    this.scaleCalStep = 4;
+    this.scaleCalText = '再走远一点';
+  }
+
+  private completeScaleCalGuidance(): void {
+    if (this.scaleCalStep === 0 || this.scaleCalStep === 3) {
+      return;
+    }
+    this.clearScaleCalTimers();
+    this.scaleCalStep = 3;
+    this.scaleCalText = '校准完成，请稍候';
+    this.scaleCalCompleteTimerId = setTimeout(() => {
+      this.scaleCalCompleteTimerId = -1;
+      animateTo({ duration: 600, curve: Curve.EaseOut }, () => {
+        this.scaleCalOpacity = 0;
+      });
+      setTimeout(() => {
+        this.scaleCalStep = 0;
+      }, 600);
+    }, 1500);
+  }
+
+  private stopScaleCalGuidance(): void {
+    this.clearScaleCalTimers();
+    this.scaleCalStep = 0;
+    this.scaleCalOpacity = 0;
+    this.scaleCalOrigin = null;
+  }
+
+  private clearScaleCalTimers(): void {
+    if (this.scaleCalTimerMoveId >= 0) {
+      clearTimeout(this.scaleCalTimerMoveId);
+      this.scaleCalTimerMoveId = -1;
+    }
+    if (this.scaleCalTimerNudgeId >= 0) {
+      clearTimeout(this.scaleCalTimerNudgeId);
+      this.scaleCalTimerNudgeId = -1;
+    }
+    if (this.scaleCalCompleteTimerId >= 0) {
+      clearTimeout(this.scaleCalCompleteTimerId);
+      this.scaleCalCompleteTimerId = -1;
+    }
   }
 
   // Phase 3 ④ — 吸附触发:三重门 aligned 首次 0→1 瞬间,触发震动 + 200ms 后淡入 HUD。
@@ -1667,6 +1766,7 @@ struct ARRingHuntCam {
   // 才能直接套到正常流程,不受"原始横躺图 vs 扶正图"差异污染。
   private captureJpegForCalib(): Promise<ArrayBuffer | null> {
     return new Promise<ArrayBuffer | null>((resolve: (v: ArrayBuffer | null) => void) => {
+      arEngineDemo.takeFrameRGBA(this.idStr);
       arEngineDemo.captureFrame(this.idStr);
       let tries: number = 0;
       const maxTries: number = 60;
@@ -1971,6 +2071,22 @@ struct ARRingHuntCam {
               if (newOri !== this.orientation) {
                 this.orientation = newOri;
               }
+              // ── Scale 校准引导:位移检测 ──
+              if (this.scaleCalStep === 2 || this.scaleCalStep === 4) {
+                const calPose: CamPose | null = arEngineDemo.getLatestCamDispPose(this.idStr) ?? null;
+                if (calPose != null) {
+                  if (this.scaleCalOrigin == null) {
+                    this.scaleCalOrigin = calPose;
+                  } else {
+                    const dx: number = calPose.px - this.scaleCalOrigin.px;
+                    const dy: number = calPose.py - this.scaleCalOrigin.py;
+                    const dz: number = calPose.pz - this.scaleCalOrigin.pz;
+                    if (Math.sqrt(dx * dx + dy * dy + dz * dz) >= 0.30) {
+                      this.completeScaleCalGuidance();
+                    }
+                  }
+                }
+              }
             }, 62)
           })
           .onDestroy(() => {
@@ -2251,6 +2367,20 @@ struct ARRingHuntCam {
             .opacity(this.lockedBannerOpacity)
             .hitTestBehavior(HitTestMode.None)
             .id('lockedBanner')
+          }
+
+          // Scale 校准引导:玻璃胶囊提示用户移动以完成 scale 校准。
+          if (this.scaleCalStep > 0) {
+            Text(this.scaleCalText)
+              .fontSize(16)
+              .fontColor(Color.White)
+              .fontWeight(FontWeight.Medium)
+              .backgroundColor(Palette.glass)
+              .padding({ left: 20, right: 20, top: 10, bottom: 10 })
+              .borderRadius(Radius.M)
+              .opacity(this.scaleCalOpacity)
+              .offset({ y: -80 })
+              .hitTestBehavior(HitTestMode.None)
           }
 
           // v13 central zoom-value indicator. Pulses on every pinch / ZoomBar tap, auto-hides
